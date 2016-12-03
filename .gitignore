@@ -1,0 +1,7 @@
+*.pyc
+*.hlt
+*.log
+*.db
+halite
+bots/
+visualizer/

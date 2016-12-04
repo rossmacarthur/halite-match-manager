@@ -11,7 +11,7 @@ import trueskill
 
 
 HALITEBIN = './halite'
-REPLAYDIR = 'replays/'
+REPLAYDIR = 'replays'
 if not os.path.exists(REPLAYDIR):
     os.makedirs(REPLAYDIR)
 
@@ -157,8 +157,10 @@ def cli(ctx):
 @cli.command()
 @click.argument('name')
 @click.argument('command')
+@click.option('--rating', type=(float, float), default=(25.000, 8.333),
+              help='Specify MU and SIGMA for bot.')
 @click.pass_context
-def add(ctx, name, command):
+def add(ctx, name, command, rating):
     """
     Add bot to the manager.
 
@@ -169,7 +171,7 @@ def add(ctx, name, command):
     db = ctx.obj
 
     if name not in db.names():
-        db.add(name, command)
+        db.add(name, command, rating=trueskill.Rating(*rating))
         db.save()
         click.echo('New bot added!')
     else:

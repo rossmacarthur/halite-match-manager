@@ -8,12 +8,13 @@ import shutil
 import subprocess
 import statistics
 import trueskill
-
+from multiprocessing import Process, Queue, cpu_count
 
 HALITEBIN = './halite'
 REPLAYDIR = 'replays'
 if not os.path.exists(REPLAYDIR):
     os.makedirs(REPLAYDIR)
+CPUs = cpu_count()
 
 
 def external(cmd):
@@ -38,14 +39,14 @@ class Database:
                 rows.append((name,
                              '{:.2f}'.format(self.db[name]['rating'].mu),
                              '{:.2f}'.format(self.db[name]['rating'].sigma),
-                             self.db[name]['games'],
+                             self.db[name]['played'],
                              self.db[name]['command']))
             rows = sorted(rows, key=lambda x: x[1], reverse=True)
             max_name = max([4]+[len(x[0]) for x in rows])
             template = '{{:>4}}  {{:<{}}}  {{:>7}}  {{:>5}} ' \
-                       ' {{:>5}}  {{}}\n'.format(max_name)
+                       ' {{:>7}}  {{}}\n'.format(max_name)
             s = template.format('Rank', 'Name', 'Rating',
-                                'Sigma', 'Games', 'Command')
+                                'Sigma', 'Played', 'Command')
             for i in range(len(rows)):
                 s += template.format(i+1, *rows[i])
             return 79*'=' + '\n' + s + 79*'='
@@ -59,10 +60,10 @@ class Database:
     def names(self):
         return list(self.db)
 
-    def add(self, name, command, rating=trueskill.Rating(), games=0):
+    def add(self, name, command, rating=trueskill.Rating(), played=0):
         self.db[name] = {'command': command,
                          'rating': rating,
-                         'games': games}
+                         'played': played}
 
     def rm(self, name):
         del self.db[name]
@@ -72,17 +73,20 @@ class Database:
 
     def set_rating(self, name, rating):
         self.db[name]['rating'] = rating
-        self.db[name]['games'] += 1
+        self.db[name]['played'] += 1
 
     def get_rating(self, name):
         return self.db[name]['rating']
 
     def reset_rating(self, name):
         self.db[name]['rating'] = trueskill.Rating()
-        self.db[name]['games'] = 0
+        self.db[name]['played'] = 0
 
 
-def pick_contestants(db, prioritize_new=True):
+def random_contestants(db):
+    """
+    Generate between 2 and 6 random contestants, prioritizing high sigma bots.
+    """
     number = random.randint(2, min(6, len(db.names())))
     contestants = []
 
@@ -101,55 +105,120 @@ def pick_contestants(db, prioritize_new=True):
     return contestants
 
 
+def random_dimensions():
+    """
+    Generate random dimensions (width, height).
+    """
+    d = random.choice(range(20, 51, 5))
+    return d, d
+
+
 def match(db, width, height, contestants):
-    number = len(contestants)
-
-    # Print out some stuff
-    click.echo(' MATCH: {} x {}, {}'.format(width, height,
-                                            ' vs '.join(contestants)))
-
-    # Run halite game
+    """
+    Runs halite game, parses output, and moves replay file.
+    """
     cmd = '{} -q -d "{} {}" '.format(HALITEBIN, width, height)
     cmd += ' '.join('"{}"'.format(db.get_command(c)) for c in contestants)
     _, stdout, _ = external(cmd)
 
-    # Parse output
-    lines = stdout.decode('utf-8').strip().split('\n')[number:]
+    lines = stdout.decode('utf-8').strip().split('\n')[len(contestants):]
     replay_file = lines[0].split(' ')[0]
-    ranks = [int(x.split()[1])-1 for x in lines[1:1+number]]
-    players = [(db.get_rating(c),) for c in contestants]
+    ranks = [int(x.split()[1])-1 for x in lines[1:1+len(contestants)]]
 
-    # Calculate and assign new rating
-    ts = trueskill.TrueSkill(draw_probability=0)
-    ratings = ts.rate(players, ranks)
-    for i in range(number):
-        db.set_rating(contestants[i], ratings[i][0])
-
-    # Move replay file
     shutil.move(replay_file, os.path.join(REPLAYDIR, replay_file))
 
-    # Print out some stuff
-    d = dict(zip(contestants, ranks))
-    contestants.sort(key=d.get)
-    click.echo('\n'.join(['   #{} {:<}'.format(i+1, contestants[i])
-                          for i in range(number)]))
-    click.echo(' Replay file: {}'.format(os.path.join(REPLAYDIR, replay_file)))
-    click.echo()
-    click.echo()
+    return ranks, replay_file
 
 
-def random_match(db):
-    dimension = random.choice(range(20, 51, 5))
-    contestants = pick_contestants(db)
-    match(db, dimension, dimension, contestants)
+def update_rankings(db, contestants, ranks):
+    """
+    Update rankings to database.
+    """
+    players = [(db.get_rating(c),) for c in contestants]
+
+    ts = trueskill.TrueSkill(draw_probability=0)
+    ratings = ts.rate(players, ranks)
+    for i in range(len(contestants)):
+        db.set_rating(contestants[i], ratings[i][0])
+
+
+def run_serial_matches(db, matches):
+    try:
+        for _ in range(matches):
+            width, height = random_dimensions()
+            contestants = random_contestants(db)
+            click.echo('MATCH: {} x {}, {}'.format(width, height,
+                       ' vs '.join(contestants)))
+            ranks, rfile = match(db, width, height, contestants)
+            update_rankings(db, contestants, ranks)
+            d = dict(zip(contestants, ranks))
+            contestants.sort(key=d.get)
+
+            click.echo('RESULT: ' +
+                       ' '.join(['  #{} {:<}'.format(i+1, contestants[i])
+                                 for i in range(len(contestants))]))
+            click.echo('Replay: {}'.format(os.path.join(REPLAYDIR, rfile)))
+            click.echo()
+    except KeyboardInterrupt:
+        click.echo()
+
+
+def run_parallel_matches(db, matches, threads):
+
+    def drainer(q):
+        while True:
+            if not q.empty():
+                yield q.get_nowait()
+            else:
+                break
+
+    def worker(db, in_queue, out_queue):
+        while True:
+            if in_queue.empty():
+                break
+            else:
+                width, height, contestants = in_queue.get()
+                click.echo('MATCH: {} x {}, {}'.format(width, height,
+                           ' vs '.join(contestants)))
+                ranks, replay_file = match(db, width, height, contestants)
+                out_queue.put((contestants, ranks, replay_file))
+
+    in_queue = Queue()
+    out_queue = Queue()
+    for i in range(matches):
+        width, height = random_dimensions()
+        contestants = random_contestants(db)
+        in_queue.put((width, height, contestants))
+    processes = [Process(target=worker, args=(db, in_queue, out_queue))
+                 for _ in range(threads)]
+    click.echo('Spawning {} workers'.format(threads))
+    for p in processes:
+        p.start()
+
+    try:
+        for p in processes:
+            p.join()
+            p.terminate()
+    except KeyboardInterrupt:
+        for p in processes:
+            p.terminate()
+    finally:
+        count = 0
+        for contestants, ranks, replay_file in drainer(out_queue):
+            count += 1
+            update_rankings(db, contestants, ranks)
+        click.echo('\nUpdated rankings using {} match results\n'.format(count))
 
 
 @click.group(context_settings=dict(help_option_names=['-h', '--help']))
 @click.pass_context
 def cli(ctx):
     """
-    Utility to run batch matches between Halite bots. Bots are rated using the
-    TrueSkill rating system.
+    Utility to run batch matches between Halite bots. A unique name, rating,
+    number of matches played, and the command to run the bot, are stored to a
+    file. Bots are rated using the TrueSkill rating system. Games are run on
+    all the currently stored bots with recently added bots (high sigma)
+    prioritized. Matches can be run either serially or in parallel.
     """
     ctx.obj = Database('manager.db')
 
@@ -165,8 +234,8 @@ def add(ctx, name, command, rating):
     Add bot to the manager.
 
     \b
-    NAME is a unique name for the bot e.g. MyBot.
-    COMMAND is the command to run the bot e.g. python3 bots/MyBot.py
+    NAME is a unique name for the bot e.g. "MyBot"
+    COMMAND is the command to run the bot e.g. "python3 bots/MyBot.py"
     """
     db = ctx.obj
 
@@ -199,28 +268,24 @@ def rm(ctx, name):
 
 
 @cli.command()
-@click.option('--number', '-n', default=-1,
-              help='Number of games to run. Default is forever (-1).')
+@click.option('--matches', '-m', type=click.IntRange(1, None), default=1,
+              help='Number of matches to run.')
+@click.option('--threads', '-t', type=click.IntRange(1, None), default=CPUs,
+              help='Number of threads to use. Default {}.'.format(CPUs))
 @click.pass_context
-def run(ctx, number):
+def run(ctx, matches, threads):
     """
-    Run some games.
+    Run matches.
 
-    \b
-    If no --number/-n option is given then games will continuously be run until
-    a keyboard interrupt.
+    If this command receives a keyboard interrupt (SIGTERM) then the matches
+    that have been completed will update the rankings before the program exits.
     """
     db = ctx.obj
 
-    try:
-        if number <= 0:
-            while True:
-                random_match(db)
-        else:
-            for _ in range(number):
-                random_match(db)
-    except KeyboardInterrupt:
-        pass
+    if threads == 1 or matches == 1:
+        run_serial_matches(db, matches)
+    else:
+        run_parallel_matches(db, matches, threads)
     db.save()
     click.echo(db)
 

@@ -16,7 +16,7 @@ Add the halite environment binary to the same directory as manager.py (or change
 
 Add bots to the manager using the `add` command:
 ```
-$ ./manager.py add "MyBot" "python3 bots/MyBot.py"
+$ ./manager.py add "bots/MyBot.py"
 ```
 An initial rating will be set and all information stored to a file.
 
@@ -29,5 +29,7 @@ This will run 10 games using 4 worker threads.
 At any time the rankings that are stored in the file can be viewed using:
 
 ```
-$ ./manager.py rankings
+$ ./manager.py ls
 ```
+
+You can use the `--help` option to get more information on commands and options.

@@ -32,18 +32,33 @@ def cli(ctx, path):
 
 
 @cli.command('reset')
+@click.option('--name', '-n', help='The unique name for the bot to reset.')
 @click.pass_obj
-def reset(manager):
+def reset(manager, name):
     """
     Reset all bot ratings and clear all games.
     """
-    manager.reset()
+    if name:
+        bot = manager.bots[name]
+        new_games = [
+            g for g in manager.games
+            if all(c not in manager.bots for c in g.match.contestants)
+        ]
+        click.confirm('This will reset the rating for bot {!r} and delete {} games. Continue?'
+                      .format(bot.name, len(manager.games) - len(new_games)), abort=True)
+        bot.reset()
+        manager.games = new_games
+        click.echo('Bot {!r} reset.'.format(bot.name))
+    else:
+        click.confirm('This will reset all bot ratings and remove all games. Continue?', abort=True)
+        manager.reset()
+        click.echo('All bots reset and games removed.')
+
     manager.save()
 
-
 @cli.command('add')
-@click.option('--name', '-n', help='A unique name for the Bot.')
-@click.option('--command', '-c', help='The command to execute the Bot.', required=True)
+@click.option('--name', '-n', help='A unique name for the bot.')
+@click.option('--command', '-c', help='The command to execute the bot.', required=True)
 @click.option('--rating', '-r', nargs=2, type=float, help='The initial rating for the bot.')
 @click.pass_obj
 def add(manager, name, command, rating):
@@ -58,28 +73,31 @@ def add(manager, name, command, rating):
             raise click.ClickException('Unable to determine name for bot from command.')
 
     if rating:
-        rating = trueskill.Rating(mu=rating[0], sigma=rating[1])
+        rating = trueskill.Rating(*rating)
     else:
         rating = None
 
-    manager.add_bot(Bot(name=name, command=command, rating=rating))
+    bot = Bot(name=name, command=command, rating=rating)
+    click.confirm('Add new bot {!r} with name {!r}?'.format(command, name), abort=True)
+    manager.add_bot(bot)
     manager.save()
 
 
 @cli.command('rm')
-@click.option('--name', '-n', help='The unique name for the Bot to remove.')
-@click.option('--all', '-a', is_flag=True, help='Remove *all* Bots.')
+@click.option('--name', '-n', help='The unique name for the bot to remove.')
 @click.pass_obj
-def rm(manager, name, all):
+def rm(manager, name):
     """
     Remove a bot from the manager.
     """
-    if all:
-        manager.bots = {}
-    elif name:
+    if name:
         del manager.bots[name]
+        click.echo('Removed bot {!r}'.format(name))
     else:
-        raise click.ClickException('Missing one of "--name" / "-n" or "--all" / "-a".')
+        click.confirm('This will remove all bots and games. Continue?', abort=True)
+        manager.reset()
+        manager.bots = {}
+        click.echo('Removed all bots')
 
     manager.save()
 
@@ -104,14 +122,6 @@ def run(manager, quiet, matches, threads, prioritize, count, dimension, seed):
     """
     Run bots against each other.
     """
-    def worker(match):
-        game = match.run()
-
-        if not quiet:
-            click.echo('=' * 80 + '\n' + str(game))
-
-        return game
-
     matches_to_run = manager.generate_matches(
         matches,
         count=count,
@@ -120,27 +130,43 @@ def run(manager, quiet, matches, threads, prioritize, count, dimension, seed):
         seed=seed
     )
 
-    start = time.time()
-    completed = 0
-    pool = Pool(threads)
-    games = pool.map(worker, matches_to_run)
-    end = time.time() - start
-
-    if not quiet:
-        click.echo('=' * 80)
-
-    for game in games:
+    def worker(match):
+        nonlocal completed
+        game = match.run()
+        if not quiet:
+            click.echo('=' * 80 + '\n' + str(game))
         completed += 1
         manager.add_game(game)
+        return game
+
+    try:
+        completed = 0
+        start = time.time()
+        pool = Pool(threads)
+        pool.map(worker, matches_to_run)
+        if not quiet:
+            click.echo('=' * 80)
+
+        end = time.time() - start
+
+    except KeyboardInterrupt:
+        click.echo()
+        if not quiet:
+            click.echo('=' * 80)
+        end = time.time() - start
+        pool.terminate()
+        if completed > 0:
+            click.confirm('Interrupted! Update bot rankings with results for {} games?'
+                          .format(completed), abort=True)
 
     click.echo('Ran {} games in {}m {}s.'
                .format(completed, round(end // 60 % 60), round(end % 60)))
     manager.save()
 
 
-@cli.command('ls')
+@cli.command('bots')
 @click.pass_obj
-def ls(manager):
+def bots(manager):
     """
     List the bots and their ratings.
     """

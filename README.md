@@ -38,7 +38,7 @@ This will run 10 games using 4 worker threads.
 The rankings that are stored in the file can be viewed using:
 
 ```
-halite-cli ls
+halite-cli bots
 ```
 
 You can use the `--help` option to get more information on commands and options.
